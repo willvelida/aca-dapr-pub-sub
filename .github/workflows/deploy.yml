@@ -1,0 +1,256 @@
+name: Deploy Sample
+
+on:
+  workflow_dispatch:
+
+jobs:
+  lint-acr-bicep:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Sign into Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Lint Bicep
+        uses: Azure/cli@v1
+        with:
+          inlineScript: |
+            az bicep build --file ./deploy/containerRegistry.bicep
+  validate-acr-bicep:
+    needs: lint-acr-bicep
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Sign into Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Run preflight validation
+        uses: azure/arm-deploy@v1
+        with:
+          deploymentName: ${{ github.run_number }}
+          resourceGroupName: ${{ secrets.AZURE_RG }}
+          template: ./deploy/containerRegistry.bicep
+          deploymentMode: Validate
+
+  preview-acr-bicep:
+    needs: validate-acr-bicep
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: azure/login@v1
+        name: Sign into Azure
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - uses: Azure/cli@v1
+        name: Run what-if
+        with:
+          inlineScript: |
+            az deployment group what-if --resource-group ${{ secrets.AZURE_RG }} --template-file ./deploy/containerRegistry.bicep
+  deploy-acr-bicep:
+    runs-on: ubuntu-latest
+    environment: Production
+    needs: preview-acr-bicep
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Sign into Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy Bicep Template
+        uses: azure/arm-deploy@v1
+        with:
+          deploymentName: ${{ github.run_number }}
+          resourceGroupName: ${{ secrets.AZURE_RG }}
+          template: ./deploy/containerRegistry.bicep
+          deploymentMode: Incremental
+
+  build-order-processor-image:
+    runs-on: ubuntu-latest
+    needs: deploy-acr-bicep
+    defaults:
+      run:
+        working-directory: './src/OrderProcessor'
+    steps:
+      - name: 'Checkout GitHub Action'
+        uses: actions/checkout@main
+      
+      - name: 'Login via Azure CLI'
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+        
+      - name: Get ACR name
+        id: getacrname
+        run: |
+          acrName=$(az acr list --resource-group ${{ secrets.AZURE_RG }} --query "[0].name" -o tsv)
+          echo "::set-output name=acrName::$acrName"
+      - name: Get ACR Credentials
+        id: getacrcreds
+        run: |
+          loginServer=$(az acr list --resource-group ${{ secrets.AZURE_RG }} --query "[0].loginServer" -o tsv)
+          loginName=$(az acr credential show -n ${{ steps.getacrname.outputs.acrName }} --resource-group ${{ secrets.AZURE_RG }} --query username -o tsv)
+          password=$(az acr credential show -n ${{ steps.getacrname.outputs.acrName }} --resource-group ${{ secrets.AZURE_RG }} --query "passwords[0].value" -o tsv)
+          echo "::set-output name=loginServer::$loginServer"
+          echo "::set-output name=loginName::$loginName"
+          echo "::set-output name=password::$password"
+      - name: 'Build and Push API Image to ACR'
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ steps.getacrcreds.outputs.loginServer }}
+          username: ${{ steps.getacrname.outputs.acrName }}
+          password: ${{ steps.getacrcreds.outputs.password }}
+      - run: |
+          docker build . -t ${{ steps.getacrcreds.outputs.loginServer }}/orderprocessor:${{ github.sha }}
+          docker push ${{ steps.getacrcreds.outputs.loginServer }}/orderprocessor:${{ github.sha }}
+  build-checkout-image:
+    runs-on: ubuntu-latest
+    needs: deploy-acr-bicep
+    defaults:
+      run:
+        working-directory: './src/Checkout'
+    steps:
+      - name: 'Checkout GitHub Action'
+        uses: actions/checkout@main
+      
+      - name: 'Login via Azure CLI'
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+        
+      - name: Get ACR name
+        id: getacrname
+        run: |
+          acrName=$(az acr list --resource-group ${{ secrets.AZURE_RG }} --query "[0].name" -o tsv)
+          echo "::set-output name=acrName::$acrName"
+      - name: Get ACR Credentials
+        id: getacrcreds
+        run: |
+          loginServer=$(az acr list --resource-group ${{ secrets.AZURE_RG }} --query "[0].loginServer" -o tsv)
+          loginName=$(az acr credential show -n ${{ steps.getacrname.outputs.acrName }} --resource-group ${{ secrets.AZURE_RG }} --query username -o tsv)
+          password=$(az acr credential show -n ${{ steps.getacrname.outputs.acrName }} --resource-group ${{ secrets.AZURE_RG }} --query "passwords[0].value" -o tsv)
+          echo "::set-output name=loginServer::$loginServer"
+          echo "::set-output name=loginName::$loginName"
+          echo "::set-output name=password::$password"
+      - name: 'Build and Push API Image to ACR'
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ steps.getacrcreds.outputs.loginServer }}
+          username: ${{ steps.getacrname.outputs.acrName }}
+          password: ${{ steps.getacrcreds.outputs.password }}
+      - run: |
+          docker build . -t ${{ steps.getacrcreds.outputs.loginServer }}/checkout:${{ github.sha }}
+          docker push ${{ steps.getacrcreds.outputs.loginServer }}/checkout:${{ github.sha }}
+  lint:
+    runs-on: ubuntu-latest
+    needs: [build-order-processor-image, build-checkout-image]
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Sign into Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Lint Bicep
+        uses: Azure/cli@v1
+        with:
+          inlineScript: |
+            az bicep build --file ./deploy/main.bicep
+  validate:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Sign into Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get ACR Login Server
+        id: getacrserver
+        run: |
+          loginServer=$(az acr list --resource-group ${{ secrets.AZURE_RG }} --query "[0].loginServer" -o tsv)
+          echo "::set-output name=loginServer::$loginServer"
+      - name: Get Images
+        id: getimages
+        run: |
+          orderProcessorImage=${{ steps.getacrserver.outputs.loginServer }}/orderprocessor:${{ github.sha }}
+          checkoutImage=${{ steps.getacrserver.outputs.loginServer }}/checkout:${{ github.sha }}
+          echo "::set-output name=orderProcessorImage::$orderProcessorImage"
+          echo "::set-output name=checkoutImage::$checkoutImage"
+      - name: Run preflight validation
+        uses: azure/arm-deploy@v1
+        with:
+          deploymentName: ${{ github.run_number }}
+          resourceGroupName: ${{ secrets.AZURE_RG }}
+          template: ./deploy/main.bicep
+          deploymentMode: Validate
+          parameters: orderProcessorImage=${{ steps.getimages.outputs.orderProcessorImage }} checkoutImage=${{ steps.getimages.outputs.checkoutImage }}
+        
+  preview:
+    needs: [lint, validate]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: azure/login@v1
+        name: Sign into Azure
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get ACR Login Server
+        id: getacrserver
+        run: |
+          loginServer=$(az acr list --resource-group ${{ secrets.AZURE_RG }} --query "[0].loginServer" -o tsv)
+          echo "::set-output name=loginServer::$loginServer"
+      - name: Get Images
+        id: getimages
+        run: |
+          checkoutImage=${{ steps.getacrserver.outputs.loginServer }}/checkout:${{ github.sha }}
+          orderProcessorImage=${{ steps.getacrserver.outputs.loginServer }}/orderprocessor:${{ github.sha }}
+          echo "::set-output name=checkoutImage::$checkoutImage"
+          echo "::set-output name=orderProcessorImage::$orderProcessorImage"
+      - uses: Azure/cli@v1
+        name: Run what-if
+        with:
+          inlineScript: |
+            az deployment group what-if --resource-group ${{ secrets.AZURE_RG }} --template-file ./deploy/main.bicep --parameters checkoutImage=${{ steps.getimages.outputs.checkoutImage }} orderProcessorImage=${{ steps.getimages.outputs.orderProcessorImage }}
+  deploy-infra:
+    runs-on: ubuntu-latest
+    environment: Production
+    needs: preview
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Sign into Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get ACR Login Server
+        id: getacrserver
+        run: |
+          loginServer=$(az acr list --resource-group ${{ secrets.AZURE_RG }} --query "[0].loginServer" -o tsv)
+          echo "::set-output name=loginServer::$loginServer"
+      - name: Get Images
+        id: getimages
+        run: |
+          checkoutImage=${{ steps.getacrserver.outputs.loginServer }}/checkout:${{ github.sha }}
+          orderProcessorImage=${{ steps.getacrserver.outputs.loginServer }}/orderprocessor:${{ github.sha }}
+          echo "::set-output name=checkoutImage::$checkoutImage"
+          echo "::set-output name=orderProcessorImage::$orderProcessorImage"
+      - name: Deploy Bicep Template
+        uses: azure/arm-deploy@v1
+        with:
+          deploymentName: ${{ github.run_number }}
+          resourceGroupName: ${{ secrets.AZURE_RG }}
+          template: ./deploy/main.bicep
+          deploymentMode: Incremental
+          parameters: checkoutImage=${{ steps.getimages.outputs.checkoutImage }} orderProcessorImage=${{ steps.getimages.outputs.orderProcessorImage }}
