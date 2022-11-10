@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "Checkout": {
+      "commandName": "Project"
+    },
+    "Docker": {
+      "commandName": "Docker"
+    }
+  }
+}
